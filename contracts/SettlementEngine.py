@@ -36,7 +36,6 @@ class SettlementEngine(gl.Contract):
     def settle(self, judgment_id: u256) -> u256:
         assert judgment_id not in self.applied_judgments, "Judgment already applied"
 
-        # Read judgment from resolver on-chain
         judgment_raw = gl.get_contract_at(
             Address(self.resolver_contract)
         ).view().get_judgment_data(judgment_id)
@@ -52,13 +51,20 @@ class SettlementEngine(gl.Contract):
         assert status == "FINAL", "Judgment is not final"
 
         verdict = judgment_data.get("verdict", "")
-        ratio = judgment_data.get("compensation_ratio", 0)
-        dispute_id = judgment_data.get("dispute_id", 0)
+        ratio = int(judgment_data.get("compensation_ratio", 0))
+        dispute_id = int(judgment_data.get("dispute_id", 0))
 
         assert verdict in ("REFUND_TO_BUYER", "RELEASE_TO_SELLER", "SPLIT"), "Invalid verdict"
         assert 0 <= ratio <= 100, "Invalid compensation ratio"
 
-        # Read dispute to get escrow_id
+        # Enforce invariant
+        if ratio == 0:
+            assert verdict == "REFUND_TO_BUYER", "Ratio 0 must be REFUND_TO_BUYER"
+        elif ratio == 100:
+            assert verdict == "RELEASE_TO_SELLER", "Ratio 100 must be RELEASE_TO_SELLER"
+        else:
+            assert verdict == "SPLIT", "Ratio between 1 and 99 must be SPLIT"
+
         dispute_raw = gl.get_contract_at(
             Address(self.resolver_contract)
         ).view().get_dispute_data(dispute_id)
@@ -70,9 +76,8 @@ class SettlementEngine(gl.Contract):
         except:
             raise gl.vm.UserError("Invalid dispute data from resolver")
 
-        escrow_id = dispute_data.get("escrow_id", 0)
+        escrow_id = int(dispute_data.get("escrow_id", 0))
 
-        # Read deposit for this escrow
         deposit_id_str = gl.get_contract_at(
             Address(self.deposit_contract)
         ).view().get_deposit_for_escrow(escrow_id)
@@ -84,7 +89,6 @@ class SettlementEngine(gl.Contract):
         except:
             raise gl.vm.UserError("Invalid deposit id from deposit vault")
 
-        # Read deposit data
         deposit_raw = gl.get_contract_at(
             Address(self.deposit_contract)
         ).view().get_deposit_data(deposit_id)
@@ -102,12 +106,12 @@ class SettlementEngine(gl.Contract):
         assert deposit_status == "LOCKED", "Deposit is not locked"
         assert total_amount > 0, "Deposit amount must be greater than zero"
 
-        # Compute split based on ratio
-        amount_to_seller = int((total_amount * ratio) // 100)
-        amount_to_buyer = total_amount - amount_to_seller
+        amount_to_seller = 0
+        amount_to_buyer = 0
 
-        # Trigger release or refund on DepositVault via write-to-write
-        if ratio == 100:
+        if verdict == "RELEASE_TO_SELLER":
+            amount_to_seller = total_amount
+            amount_to_buyer = 0
             gl.get_contract_at(
                 Address(self.deposit_contract)
             ).emit().release_to_seller(
@@ -115,7 +119,9 @@ class SettlementEngine(gl.Contract):
                 judgment_id,
                 self.resolver_contract,
             )
-        elif ratio == 0:
+        elif verdict == "REFUND_TO_BUYER":
+            amount_to_seller = 0
+            amount_to_buyer = total_amount
             gl.get_contract_at(
                 Address(self.deposit_contract)
             ).emit().refund_to_buyer(
@@ -123,14 +129,16 @@ class SettlementEngine(gl.Contract):
                 judgment_id,
                 self.resolver_contract,
             )
-        else:
-            # SPLIT: release proportional amount
+        else:  # SPLIT
+            amount_to_seller = (total_amount * ratio) // 100
+            amount_to_buyer = total_amount - amount_to_seller
             gl.get_contract_at(
                 Address(self.deposit_contract)
-            ).emit().release_to_seller(
+            ).emit().release_split(
                 u256(deposit_id),
                 judgment_id,
                 self.resolver_contract,
+                u256(ratio),
             )
 
         sid = self.next_id
