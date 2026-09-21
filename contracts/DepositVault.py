@@ -16,6 +16,8 @@ class Deposit:
     status: str
     released_to: str
     judgment_id: u256
+    amount_to_seller: u256
+    amount_to_buyer: u256
 
 
 class DepositVault(gl.Contract):
@@ -53,7 +55,6 @@ class DepositVault(gl.Contract):
         assert escrow_status == "CREATED", "Escrow is not in CREATED status"
         assert amount == u256(escrow_amount), "Deposit amount must match escrow amount"
 
-        # Check no duplicate deposit for this escrow
         assert escrow_id not in self.escrow_for_deposit, "Escrow already funded"
 
         did = self.next_id
@@ -67,10 +68,11 @@ class DepositVault(gl.Contract):
             status="LOCKED",
             released_to="",
             judgment_id=u256(0),
+            amount_to_seller=u256(0),
+            amount_to_buyer=u256(0),
         )
         self.escrow_for_deposit[escrow_id] = did
 
-        # Notify factory that escrow is funded
         gl.get_contract_at(
             Address(self.factory_contract)
         ).emit().mark_funded(escrow_id, str(gl.message.sender_address))
@@ -83,7 +85,6 @@ class DepositVault(gl.Contract):
         dep = self.deposits[deposit_id]
         assert dep.status == "LOCKED", "Deposit is not locked"
 
-        # Read judgment from resolver on-chain
         judgment_raw = gl.get_contract_at(
             Address(resolver_address)
         ).view().get_judgment_data(judgment_id)
@@ -99,7 +100,6 @@ class DepositVault(gl.Contract):
         assert verdict == "RELEASE_TO_SELLER", "Judgment does not authorize release to seller"
         assert judgment_data.get("status", "") == "FINAL", "Judgment is not final"
 
-        # Read escrow to get seller
         escrow_raw = gl.get_contract_at(
             Address(self.factory_contract)
         ).view().get_escrow_data(dep.escrow_id)
@@ -117,6 +117,8 @@ class DepositVault(gl.Contract):
         dep.status = "RELEASED"
         dep.released_to = seller
         dep.judgment_id = judgment_id
+        dep.amount_to_seller = dep.amount
+        dep.amount_to_buyer = u256(0)
         self.deposits[deposit_id] = dep
 
         gl.get_contract_at(
@@ -150,11 +152,78 @@ class DepositVault(gl.Contract):
         dep.status = "REFUNDED"
         dep.released_to = buyer
         dep.judgment_id = judgment_id
+        dep.amount_to_seller = u256(0)
+        dep.amount_to_buyer = dep.amount
         self.deposits[deposit_id] = dep
 
         gl.get_contract_at(
             Address(self.factory_contract)
         ).emit().mark_refunded(dep.escrow_id)
+
+        return True
+
+    @gl.public.write
+    def release_split(
+        self,
+        deposit_id: u256,
+        judgment_id: u256,
+        resolver_address: str,
+        seller_ratio: u256,
+    ):
+        assert deposit_id in self.deposits, "Deposit not found"
+        dep = self.deposits[deposit_id]
+        assert dep.status == "LOCKED", "Deposit is not locked"
+
+        ratio_int = int(seller_ratio)
+        assert 0 < ratio_int < 100, "Split ratio must be strictly between 0 and 100"
+
+        judgment_raw = gl.get_contract_at(
+            Address(resolver_address)
+        ).view().get_judgment_data(judgment_id)
+
+        assert judgment_raw != "NOT_FOUND", "Judgment not found"
+
+        try:
+            judgment_data = json.loads(judgment_raw)
+        except:
+            raise gl.vm.UserError("Invalid judgment data from resolver")
+
+        verdict = judgment_data.get("verdict", "")
+        assert verdict == "SPLIT", "Judgment does not authorize split"
+        assert judgment_data.get("status", "") == "FINAL", "Judgment is not final"
+
+        stored_ratio = int(judgment_data.get("compensation_ratio", 0))
+        assert stored_ratio == ratio_int, "Ratio mismatch with stored judgment"
+
+        escrow_raw = gl.get_contract_at(
+            Address(self.factory_contract)
+        ).view().get_escrow_data(dep.escrow_id)
+
+        assert escrow_raw != "NOT_FOUND", "Escrow not found in factory"
+
+        try:
+            escrow_data = json.loads(escrow_raw)
+        except:
+            raise gl.vm.UserError("Invalid escrow data from factory")
+
+        seller = escrow_data.get("seller", "")
+        buyer = dep.depositor
+        assert seller != "", "Seller not found in escrow"
+
+        total = int(dep.amount)
+        amount_to_seller = (total * ratio_int) // 100
+        amount_to_buyer = total - amount_to_seller
+
+        dep.status = "SPLIT"
+        dep.released_to = f"SELLER:{seller};BUYER:{buyer}"
+        dep.judgment_id = judgment_id
+        dep.amount_to_seller = u256(amount_to_seller)
+        dep.amount_to_buyer = u256(amount_to_buyer)
+        self.deposits[deposit_id] = dep
+
+        gl.get_contract_at(
+            Address(self.factory_contract)
+        ).emit().mark_settled(dep.escrow_id)
 
         return True
 
@@ -165,7 +234,7 @@ class DepositVault(gl.Contract):
         dep = self.deposits[did]
 
         caller = str(gl.message.sender_address)
-        assert caller == str(gl.message.sender_address), "Invalid caller"
+        assert caller == dep.depositor, "Only depositor can trigger refund on cancel"
 
         escrow_raw = gl.get_contract_at(
             Address(self.factory_contract)
@@ -182,6 +251,8 @@ class DepositVault(gl.Contract):
 
         dep.status = "REFUNDED"
         dep.released_to = dep.depositor
+        dep.amount_to_seller = u256(0)
+        dep.amount_to_buyer = dep.amount
         self.deposits[did] = dep
 
         gl.get_contract_at(
@@ -194,8 +265,7 @@ class DepositVault(gl.Contract):
     def get_deposit_status(self, deposit_id: u256) -> str:
         if deposit_id not in self.deposits:
             return "NOT_FOUND"
-        dep = self.deposits[deposit_id]
-        return dep.status
+        return self.deposits[deposit_id].status
 
     @gl.public.view
     def get_deposit_details(self, deposit_id: u256) -> str:
@@ -210,6 +280,8 @@ class DepositVault(gl.Contract):
             "status": dep.status,
             "released_to": dep.released_to,
             "judgment_id": int(dep.judgment_id),
+            "amount_to_seller": int(dep.amount_to_seller),
+            "amount_to_buyer": int(dep.amount_to_buyer),
         })
 
     @gl.public.view
@@ -229,8 +301,7 @@ class DepositVault(gl.Contract):
     def get_deposit_for_escrow(self, escrow_id: u256) -> str:
         if escrow_id not in self.escrow_for_deposit:
             return "NOT_FOUND"
-        did = self.escrow_for_deposit[escrow_id]
-        return str(int(did))
+        return str(int(self.escrow_for_deposit[escrow_id]))
 
     @gl.public.view
     def list_deposits(self) -> str:
